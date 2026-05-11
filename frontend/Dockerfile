@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1.7
+
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+
+ENV PORT=3000
+EXPOSE 3000
+
+CMD ["node", "server.js"]
