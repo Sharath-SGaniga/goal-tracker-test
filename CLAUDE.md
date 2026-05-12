@@ -19,11 +19,20 @@ The Dockerfiles referenced by `docker-local-deployment/docker-compose.yml` (`../
 
 ## Commands
 
-### Local stack (intended path, currently blocked on missing Dockerfiles)
+### Local stack
 ```bash
-cd docker-local-deployment && docker-compose up -d
+cd docker-local-deployment && docker compose up -d
 ```
-Brings up frontend (`:3000`), backend (`:8080`), and Postgres 15 (`:5432`, db `goalsdb`, user/pass `postgres/postgres`).
+Brings up frontend (`:3000`), backend (`:8080`), and Postgres 15 (`:5432`, db `goalsdb`, user/pass `postgres/postgres`). Verified working end-to-end inside a GitHub Codespace.
+
+### Build & push images (Docker Hub)
+```bash
+docker build -t <user>/goal-tracker-backend:v1  ./backend
+docker build -t <user>/goal-tracker-frontend:v1 ./frontend
+docker push <user>/goal-tracker-backend:v1
+docker push <user>/goal-tracker-frontend:v1
+```
+Tag with an immutable version (`:v1`, git SHA, etc.), not just `:latest` — the README's eventual Terraform deploy uses `:latest`, which is mutable and a footgun. Push both tags if you must.
 
 ### Backend (Go, Gin)
 ```bash
@@ -57,6 +66,30 @@ Three-tier "goal tracker" — the data model is one table, `goals(id, goal_name)
 - **Observability.** Prometheus metrics are exposed at `/metrics`: `add_goal_requests_total`, `remove_goal_requests_total`, and `http_requests_total{path=...}`. Each handler increments `httpRequestsCounter` with its route as the label — when adding a new route, add the matching `.WithLabelValues(...).Inc()` call or it will be invisible in metrics.
 
 - **CORS allowlist** in `main.go` is hardcoded to `http://localhost:3000` and `http://frontend:3000` (the docker-compose service name). Any new frontend origin must be added there.
+
+## Kubernetes deployment (`k8s/`)
+
+Manifests live (or will live) under `k8s/`, one file per resource with numeric prefixes so `kubectl apply -f k8s/` orders correctly. Everything goes in a single namespace (e.g. `goal-tracker`).
+
+**Service names are load-bearing — don't rename without updating the consumers:**
+- Postgres `Service` must be named `postgres` → backend's `DB_HOST` defaults to this.
+- Backend `Service` must be named `backend` → frontend's `BACKEND_URL` is `http://backend:8080`.
+- Frontend `Service` is the only externally-reachable one. Inside a kind cluster, use `NodePort` + `kubectl port-forward`; with a real cloud LB or Ingress controller, switch type accordingly.
+
+**Postgres tier specifics:**
+- A single `Secret` (Opaque) holds DB credentials and is consumed by *both* the Postgres pod (`POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`) and the backend pod (`DB_USERNAME`/`DB_PASSWORD`/`DB_NAME`). Design the keys so both consumers can `envFrom` it, or use explicit `valueFrom.secretKeyRef` per var.
+- `init.sql` is delivered via a `ConfigMap` mounted at `/docker-entrypoint-initdb.d/init.sql` (use `subPath: init.sql` on the volumeMount, otherwise the whole directory is shadowed).
+- Persistent storage: a `PersistentVolumeClaim` at `/var/lib/postgresql/data`. 1Gi is plenty for testing; leave `storageClassName` unset so the cluster default is used.
+- A plain `Deployment` is acceptable for learning; `StatefulSet` is more correct for production (stable identity, ordered startup) but not required.
+
+**Backend tier specifics:**
+- `backend/main.go:93-97` does **not retry** the DB connection on startup. If Postgres isn't ready, the pod exits and K8s restarts it. Liveness probe handles this naturally; alternatively, add an `initContainer` that waits for Postgres.
+- Probe target: HTTP GET `/health` on port 8080 (defined at `backend/main.go:340`). Use it for both readiness and liveness; give liveness a longer `initialDelaySeconds` (~15s) to absorb cold-start.
+- All env vars from `backend/main.go:50-58` are required: `DB_HOST`, `DB_PORT`, `DB_USERNAME`, `DB_PASSWORD`, `DB_NAME`, `SSL`. `DB_PORT` and `PORT` are strings (env vars always are).
+
+**Frontend tier specifics:**
+- No `/health` endpoint exists; `server.js:63` catch-all serves `index.html` for any path, so `GET /` is a working readiness check.
+- CORS allowlist in `backend/main.go:87` includes `http://frontend:3000` — that name happens to match the Service convention, so cross-tier requests originating from a backend caller named `frontend` would be allowed. In normal use the browser hits the frontend Service and the proxy talks to the backend in-cluster, so CORS never engages.
 
 ## Conventions worth knowing
 

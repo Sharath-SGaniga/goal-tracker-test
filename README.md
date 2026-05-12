@@ -102,6 +102,161 @@ docker-compose up -d
 
 
 
+# Kubernetes Deployment (AKS)
+
+The application can also be deployed to an Azure Kubernetes Service (AKS) cluster using the manifests in the `K8s/` directory. This is a middle ground between local docker-compose (single host) and the full Terraform infrastructure (multi-tier VMs).
+
+## Architecture on AKS
+
+```
+Internet ──► Azure Load Balancer (public IP)
+                 │
+                 ▼
+          nginx Ingress Controller   (app-routing-system namespace, installed via AKS add-on)
+                 │
+                 ▼  (routes / → frontend Service)
+          frontend Service (ClusterIP) ──► frontend pods (Node/Express on :3000)
+                                                  │  BACKEND_URL=http://backend:8080
+                                                  ▼
+                                          backend Service (ClusterIP) ──► backend pods (Go/Gin on :8080)
+                                                                                │  DB_HOST=postgres, creds from Secret
+                                                                                ▼
+                                                                        postgres Service (ClusterIP) ──► postgres pod (:5432)
+                                                                                                                │
+                                                                                                                ▼
+                                                                                                        Azure managed disk (PVC)
+```
+
+Only the Ingress Controller has a public IP. All app Services are `ClusterIP` — internal-only. The frontend's Express proxy is what bridges browser requests to the backend over the in-cluster network.
+
+## Manifests in `K8s/`
+
+| File | Resource |
+|---|---|
+| `00-namespace.yaml` | Namespace `goal-tracker` |
+| `10-postgres-secret.yaml` | DB credentials (consumed by both Postgres and backend) |
+| `11-postgres-configmap.yaml` | `init.sql` mounted into Postgres on first boot |
+| `12-postgres-pvc.yaml` | 1Gi PVC, dynamically provisioned as an Azure managed disk |
+| `13-postgres-deployment.yaml` | Postgres Deployment + Service (`postgres`, port 5432) |
+| `backend-deploy.yaml` | Backend Deployment + Service (`backend`, port 8080) |
+| `frontend.yaml` | Frontend Deployment + Service (`frontend`, port 80 → 3000) |
+| `40-ingress.yaml` | Ingress routing all traffic to the `frontend` Service |
+
+The numeric prefixes ensure `kubectl apply -f K8s/` processes files in dependency order (namespace before things that live in it, Secret/ConfigMap/PVC before the Deployment that mounts them).
+
+## Prerequisites
+
+- Azure CLI installed and logged in (`az login`)
+- `kubectl` installed
+- Docker Hub account, with backend and frontend images pushed:
+  ```bash
+  docker build -t <DOCKERHUB_USER>/goal-tracker-backend:latest  ./backend
+  docker build -t <DOCKERHUB_USER>/goal-tracker-frontend:latest ./frontend
+  docker push <DOCKERHUB_USER>/goal-tracker-backend:latest
+  docker push <DOCKERHUB_USER>/goal-tracker-frontend:latest
+  ```
+- Before applying the manifests, edit the `image:` field in `K8s/backend-deploy.yaml` and `K8s/frontend.yaml` to your Docker Hub username.
+
+## Step 1 — Create the AKS cluster
+
+```bash
+RG=goal-tracker-rg
+CLUSTER=goal-tracker-aks
+LOCATION=eastus2
+
+az group create --name $RG --location $LOCATION
+
+az aks create \
+  --resource-group $RG --name $CLUSTER \
+  --node-count 1 \
+  --node-vm-size Standard_B2s \
+  --generate-ssh-keys \
+  --enable-managed-identity \
+  --tier free
+
+az aks get-credentials --resource-group $RG --name $CLUSTER
+kubectl get nodes
+```
+
+`--tier free` keeps the control plane free; node VMs bill hourly (~$0.04/hr for `Standard_B2s`). A single `B2s` node is sufficient for this workload with `replicas: 1` on each tier; scale up the node count or VM size if running 2+ replicas per tier.
+
+## Step 2 — Enable the Ingress controller
+
+```bash
+az aks approuting enable --resource-group $RG --name $CLUSTER
+```
+
+This installs an nginx Ingress controller (the `app-routing-system` namespace) and registers the IngressClass `webapprouting.kubernetes.azure.com` — the value referenced in `K8s/40-ingress.yaml`.
+
+## Step 3 — Apply the manifests
+
+```bash
+kubectl apply -f K8s/
+```
+
+If you see `namespaces "goal-tracker" not found` errors on the first apply (file-ordering race), simply re-run the same command — the namespace will have been created on the first pass.
+
+## Step 4 — Verify
+
+```bash
+kubectl -n goal-tracker get all
+kubectl -n goal-tracker get endpoints
+kubectl get ingress -n goal-tracker
+```
+
+The Ingress `ADDRESS` field will populate with a public IP after ~30–90 seconds. All pods should show `1/1 READY` and `Running`.
+
+## Step 5 — Access the application
+
+```bash
+INGRESS_IP=$(kubectl get ingress goal-tracker -n goal-tracker -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+echo "App URL: http://$INGRESS_IP"
+
+# Smoke test:
+curl http://$INGRESS_IP/api/goals
+curl -X POST http://$INGRESS_IP/api/goals \
+  -H "Content-Type: application/json" \
+  -d '{"goal_name":"deployed via AKS"}'
+```
+
+Then open `http://<INGRESS-IP>` in a browser — no port suffix; the Ingress listens on port 80.
+
+## Common operations
+
+```bash
+# Tail logs from any tier:
+kubectl -n goal-tracker logs deploy/backend -f
+kubectl -n goal-tracker logs deploy/frontend -f
+kubectl -n goal-tracker logs deploy/postgres -f
+
+# Open a shell in a pod:
+kubectl -n goal-tracker exec -it deploy/backend -- sh
+
+# Inspect the DB directly:
+kubectl -n goal-tracker exec -it deploy/postgres -- \
+  psql -U postgres -d goalsdb -c "SELECT * FROM goals;"
+
+# Scale a tier:
+kubectl -n goal-tracker scale deploy frontend --replicas=2
+
+# Force a new image pull (after pushing a new :latest):
+kubectl -n goal-tracker rollout restart deploy/backend
+kubectl -n goal-tracker rollout restart deploy/frontend
+```
+
+## Cleanup
+
+```bash
+# Cheapest: stop the cluster (preserves config, zero node compute charges)
+az aks stop --resource-group $RG --name $CLUSTER
+# Restart later with:
+az aks start --resource-group $RG --name $CLUSTER
+
+# Full teardown (deletes cluster, IPs, disks, everything):
+az group delete --name $RG --yes --no-wait
+```
+
+
 # 3-Tier Application Infrastructure on Azure
 
 This Terraform project deploys a secure and scalable 3-tier application infrastructure in Azure, consisting of frontend, backend, and database tiers.
